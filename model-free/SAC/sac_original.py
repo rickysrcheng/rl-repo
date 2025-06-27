@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.distributions import Normal, TanhTransform
+from torch.distributions import Normal, TanhTransform, AffineTransform, TransformedDistribution
 
 from torchrl.data import ReplayBuffer, LazyTensorStorage
 from tensordict import TensorDict
@@ -34,7 +34,7 @@ class Args:
     alpha: float = 0.2
 
     buffer_size: int = 100_000
-    batch_size: int = 128
+    batch_size: int = 256
     warmup_timesteps: int = 25_000
 
     eps_begin: float = 0.4
@@ -107,8 +107,12 @@ class Policy(nn.Module):
         x = self.network(x)
         mean = self.mean_head(x)
         logstd = self.logstd_head(x)
-        #logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (logstd + 1)
-        logstd = logstd.clamp(-20, 2)
+        
+        #logstd = logstd.clamp(-20, 2)
+
+        # not sure why cleanrl does this, but it seems to be a way to bound the logstd?
+        logstd = torch.tanh(logstd)
+        logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (logstd + 1)
         return mean, logstd
     
     def select_action(self, x):
@@ -116,9 +120,9 @@ class Policy(nn.Module):
         std = logstd.exp()
         # create squashed Gaussian distribution
         normal = Normal(mean, std)
-        # tanh_transform = torch.distributions.TanhTransform(cache_size=1)
-        # affine_transform = torch.distributions.AffineTransform(loc=self.action_bias, scale=self.action_scale)
-        # dist = torch.distributions.TransformedDistribution(
+        # tanh_transform = TanhTransform(cache_size=1)
+        # affine_transform = AffineTransform(loc=self.action_bias, scale=self.action_scale)
+        # dist = TransformedDistribution(
         #     normal,
         #     [tanh_transform, affine_transform]
         # )
@@ -126,6 +130,9 @@ class Policy(nn.Module):
         # action = dist.rsample()
         # log_prob = dist.log_prob(action)
         # log_prob = torch.sum(log_prob, 1, keepdim=True)
+
+        # used above for tanh transform, but i think it's numerically unstable
+        # so used cleanrl's implementation instead
         u = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
         u_tanh = torch.tanh(u)
         action = u_tanh * self.action_scale + self.action_bias
@@ -240,7 +247,7 @@ if __name__ == "__main__":
                 q_values2 = q_net2(state_batch, state_actions).squeeze(1)
                 q_values = torch.min(q_values1, q_values2)
 
-                value_target =  q_values - logp.squeeze(1)
+                value_target =  q_values - args.alpha*logp.squeeze(1)
 
             # update value function
             state_values = v_net(state_batch)
@@ -285,12 +292,12 @@ if __name__ == "__main__":
             action, logp = policy_net.select_action(state_batch)
             min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
 
-            actor_loss = (min_q - logp.squeeze(1)).mean()
+            actor_loss = (args.alpha*logp.squeeze(1) - min_q).mean()
             
             writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
             policy_optimizer.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+            #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
             policy_optimizer.step()
         
             # soft update only when updating actor weights

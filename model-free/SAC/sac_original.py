@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 class Args:
     tracking: bool = False
     wandb_entity: str = ""
-    wandb_project: str = f"sac"
+    wandb_project: str = f"sac-v1"
     wandb_mode: str = "disabled"
 
     env_id: str = "Walker2d-v5"
@@ -35,7 +35,7 @@ class Args:
 
     buffer_size: int = 100_000
     batch_size: int = 256
-    warmup_timesteps: int = 25_000
+    warmup_timesteps: int = 5_000
 
     eps_begin: float = 0.4
     eps_end: float = 0.1
@@ -250,7 +250,7 @@ if __name__ == "__main__":
                 value_target =  q_values - args.alpha*logp.squeeze(1)
 
             # update value function
-            state_values = v_net(state_batch)
+            state_values = v_net(state_batch).squeeze(1)
             value_loss = F.mse_loss(state_values, value_target)
 
             writer.add_scalar("losses/v_val", state_values.mean().item(), global_step)

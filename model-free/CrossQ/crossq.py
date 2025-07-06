@@ -1,5 +1,6 @@
 import gymnasium as gym
-import math
+import math, random
+import numpy as np
 
 from dataclasses import dataclass
 import tyro
@@ -24,18 +25,20 @@ class Args:
     wandb_project: str = f"crossq"
     wandb_mode: str = "disabled"
 
-    env_id: str = "Walker2d-v5"
+    env_id: str = "Pendulum-v1"
     total_timesteps: int = 1_000_000
     use_vf: bool = True
-    critic_hidden_size: int = 1024
+    critic_hidden_size: int = 256
     actor_hidden_size: int = 256
+    autotune: bool = True
+    seed: int = 42
 
     learning_rate: float = 1e-3
     gamma: float = 0.99
     tau: float = 0.005
     alpha: float = 0.2
     adam_betas: tuple = (0.5, 0.999)
-    bn_momentum: float = 0.99
+    bn_momentum: float = 0.01
 
     buffer_size: int = 100_000
     batch_size: int = 256
@@ -58,11 +61,9 @@ class QNetwork(nn.Module):
             BatchRenorm1d(n_observations + n_actions, momentum=momentum),
             nn.Linear(n_observations + n_actions, hidden_size),
             BatchRenorm1d(hidden_size, momentum=momentum),
-            #nn.BatchNorm1d(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             BatchRenorm1d(hidden_size, momentum=momentum),
-            #nn.BatchNorm1d(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
@@ -88,8 +89,8 @@ class Policy(nn.Module):
             nn.ReLU()
         )
 
-        self.mean_head = nn.Linear(256, n_actions)
-        self.logstd_head = nn.Linear(256, n_actions)
+        self.mean_head = nn.Linear(hidden_size, n_actions)
+        self.logstd_head = nn.Linear(hidden_size, n_actions)
 
         self.register_buffer(
             "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
@@ -104,10 +105,7 @@ class Policy(nn.Module):
         x = self.network(x)
         mean = self.mean_head(x)
         logstd = self.logstd_head(x)
-        
-        #logstd = logstd.clamp(-20, 2)
 
-        # not sure why cleanrl does this, but it seems to be a way to bound the logstd?
         logstd = torch.tanh(logstd)
         logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (logstd + 1)
         return mean, logstd
@@ -127,11 +125,6 @@ class Policy(nn.Module):
 
         return action, log_prob
 
-
-def soft_update(net, target_net, args):
-    for param, target_param in zip(net.parameters(), target_net.parameters()):
-        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-
 def tuple_to_tensordict(state, action, reward, next_state, done):
     return TensorDict({
         "state": torch.tensor(state, dtype=torch.float32),
@@ -144,7 +137,11 @@ def tuple_to_tensordict(state, action, reward, next_state, done):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     env = gym.make(args.env_id)
-    env = gym.wrappers.NormalizeObservation(env)
+    env.action_space.seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     if args.tracking:
         import wandb
         run = wandb.init(
@@ -168,6 +165,14 @@ if __name__ == "__main__":
         "mps" if torch.backends.mps.is_available() else
         "cpu"
     )
+
+    if args.autotune:
+        target_entropy = -torch.prod(torch.Tensor(env.action_space.shape[0]).to(device)).item()
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        alpha = log_alpha.exp().item()
+        a_optimizer = optim.Adam([log_alpha], lr=args.learning_rate)
+    else:
+        alpha = args.alpha
 
     policy_net = Policy(env, args).to(device)
     policy_net.eval()
@@ -238,7 +243,7 @@ if __name__ == "__main__":
 
             # calculate TD Target
             next_q_values = torch.min(next_q_values1, next_q_values2)
-            next_state_values =  next_q_values - args.alpha*next_logp.squeeze(1)
+            next_state_values =  next_q_values - alpha*next_logp.squeeze(1)
 
             td_target = reward_batch + args.gamma * next_state_values * (1 - done_batch) 
             td_target = td_target.detach()           
@@ -271,13 +276,22 @@ if __name__ == "__main__":
 
                 min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
 
-                actor_loss = (args.alpha*logp.squeeze(1) - min_q).mean()
+                actor_loss = (alpha*logp.squeeze(1) - min_q).mean()
                 
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 policy_optimizer.zero_grad()
                 actor_loss.backward()
                 #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
                 policy_optimizer.step()
+                if args.autotune:
+                    with torch.no_grad():
+                        action, logp = policy_net.select_action(state_batch)
+                    alpha_loss = (-log_alpha.exp() * (logp + target_entropy)).mean()
+
+                    a_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    a_optimizer.step()
+                    alpha = log_alpha.exp().item()
 
 
         if done:

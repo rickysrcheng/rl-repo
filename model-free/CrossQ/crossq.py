@@ -34,6 +34,8 @@ class Args:
     gamma: float = 0.99
     tau: float = 0.005
     alpha: float = 0.2
+    adam_betas: tuple = (0.5, 0.999)
+    bn_momentum: float = 0.99
 
     buffer_size: int = 100_000
     batch_size: int = 256
@@ -51,13 +53,15 @@ class QNetwork(nn.Module):
         n_observations = env.observation_space.shape[0]
         n_actions = env.action_space.shape[0]
         hidden_size = args.critic_hidden_size
+        momentum = args.bn_momentum
         self.network = nn.Sequential(
+            BatchRenorm1d(n_observations + n_actions, momentum=momentum),
             nn.Linear(n_observations + n_actions, hidden_size),
-            BatchRenorm1d(hidden_size),
+            BatchRenorm1d(hidden_size, momentum=momentum),
             #nn.BatchNorm1d(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size),
+            BatchRenorm1d(hidden_size, momentum=momentum),
             #nn.BatchNorm1d(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
@@ -73,12 +77,14 @@ class Policy(nn.Module):
         n_observations = env.observation_space.shape[0]
         n_actions = env.action_space.shape[0]
         hidden_size = args.actor_hidden_size
+        momentum = args.bn_momentum
         self.network = nn.Sequential(
+            BatchRenorm1d(n_observations, momentum=momentum),
             nn.Linear(n_observations, hidden_size),
-            BatchRenorm1d(hidden_size),
+            BatchRenorm1d(hidden_size, momentum=momentum),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size),
+            BatchRenorm1d(hidden_size, momentum=momentum),
             nn.ReLU()
         )
 
@@ -138,6 +144,7 @@ def tuple_to_tensordict(state, action, reward, next_state, done):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     env = gym.make(args.env_id)
+    env = gym.wrappers.NormalizeObservation(env)
     if args.tracking:
         import wandb
         run = wandb.init(
@@ -170,9 +177,9 @@ if __name__ == "__main__":
     q_net1.eval()
     q_net2.eval()   
 
-    policy_optimizer = optim.Adam(policy_net.parameters(), lr=args.learning_rate)
-    q1_optimizer = optim.Adam(q_net1.parameters(), lr=args.learning_rate)
-    q2_optimizer = optim.Adam(q_net2.parameters(), lr=args.learning_rate)
+    policy_optimizer = optim.Adam(policy_net.parameters(), lr=args.learning_rate, betas=args.adam_betas)
+    q1_optimizer = optim.Adam(q_net1.parameters(), lr=args.learning_rate, betas=args.adam_betas)
+    q2_optimizer = optim.Adam(q_net2.parameters(), lr=args.learning_rate, betas=args.adam_betas)
 
     # switch to torchrl buffer
     rb = ReplayBuffer(storage=LazyTensorStorage(args.buffer_size), 
@@ -226,12 +233,9 @@ if __name__ == "__main__":
             q_net2.eval()   
 
             # Extract current q values and next Q-values
-            state_action_values1 = combined_action_values1[:args.batch_size]
-            state_action_values2 = combined_action_values2[:args.batch_size]
+            q_values1, next_q_values1 = torch.chunk(combined_action_values1, 2, dim=0)
+            q_values2, next_q_values2 = torch.chunk(combined_action_values2, 2, dim=0)
 
-            next_q_values1 = combined_action_values1[args.batch_size:]
-            next_q_values2 = combined_action_values2[args.batch_size:]
-            
             # calculate TD Target
             next_q_values = torch.min(next_q_values1, next_q_values2)
             next_state_values =  next_q_values - args.alpha*next_logp.squeeze(1)
@@ -239,14 +243,14 @@ if __name__ == "__main__":
             td_target = reward_batch + args.gamma * next_state_values * (1 - done_batch) 
             td_target = td_target.detach()           
             # Compute q_loss
-            q1_loss = F.mse_loss(state_action_values1, td_target)
-            q2_loss = F.mse_loss(state_action_values2, td_target)
+            q1_loss = F.mse_loss(q_values1, td_target)
+            q2_loss = F.mse_loss(q_values2, td_target)
 
             avg_loss = (q1_loss + q2_loss)/2
 
-            writer.add_scalar("losses/q1_val", state_action_values1.mean().item(), global_step)
+            writer.add_scalar("losses/q1_val", q_values1.mean().item(), global_step)
             writer.add_scalar("losses/q1_loss", q1_loss.item(), global_step)
-            writer.add_scalar("losses/q2_val", state_action_values2.mean().item(), global_step)
+            writer.add_scalar("losses/q2_val", q_values2.mean().item(), global_step)
             writer.add_scalar("losses/q2_loss", q2_loss.item(), global_step)
             writer.add_scalar("losses/avg_q_loss", avg_loss, global_step)
 
@@ -258,20 +262,22 @@ if __name__ == "__main__":
             q2_loss.backward()
             q2_optimizer.step()
 
-            # Optimize actor
-            policy_net.train()
-            action, logp = policy_net.select_action(state_batch)
-            policy_net.eval()
+            # Policy Delay
+            if global_step % args.update_policy_frequency == 0:
+                # Optimize actor
+                policy_net.train()
+                action, logp = policy_net.select_action(state_batch)
+                policy_net.eval()
 
-            min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
+                min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
 
-            actor_loss = (args.alpha*logp.squeeze(1) - min_q).mean()
-            
-            writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-            policy_optimizer.zero_grad()
-            actor_loss.backward()
-            #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-            policy_optimizer.step()
+                actor_loss = (args.alpha*logp.squeeze(1) - min_q).mean()
+                
+                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                policy_optimizer.zero_grad()
+                actor_loss.backward()
+                #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+                policy_optimizer.step()
 
 
         if done:

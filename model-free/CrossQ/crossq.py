@@ -17,6 +17,7 @@ from torchrl.data import ReplayBuffer, LazyTensorStorage
 from torchrl.modules import BatchRenorm1d
 from tensordict import TensorDict
 from torch.utils.tensorboard import SummaryWriter
+import pprint
 
 @dataclass
 class Args:
@@ -221,8 +222,8 @@ if __name__ == "__main__":
                       batch_size=args.batch_size)
     
     state, _ = envs.reset(seed=args.seed)
-    episode_return = 0
-    episode_length = 0
+
+    
     episodes = 0
     for global_step in range(args.total_timesteps):
 
@@ -236,19 +237,26 @@ if __name__ == "__main__":
         next_state, reward, terminated, truncated, infos = envs.step(action)
         done = np.logical_or(terminated, truncated)
 
-        # gymnasium doesn't have a "final_observation" key in infos anymore?
-        if "episode" in infos:
-            for idx in range(args.num_envs):
-                if infos["_episode"][idx]:
-                    #print(f"global_step={global_step}, episodic_return={infos['episode']['r'][idx]}")
-                    writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
-                    writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
+        # # gymnasium doesn't have a "final_observation" key in infos anymore?
+        # if "episode" in infos:
+        #     for idx in range(args.num_envs):
+        #         if infos["_episode"][idx]:
+        #             #print(f"global_step={global_step}, episodic_return={infos['episode']['r'][idx]}")
+        #             writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
+        #             writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
         
         # https://farama.org/Vector-Autoreset-Mode, change to SAME_STEP autoreset mode
+        #pprint.pprint(infos)  # Print the infos dictionary for debugging
         real_next_state = next_state.copy()
-        for i in range(envs.num_envs):
-            if terminated[i] or truncated[i]:
-                real_next_state[i] = infos["final_obs"][i]
+        if "_final_info" in infos:
+            for i in range(envs.num_envs):
+                if infos["_final_info"][i]: # this env has finished this step
+                    episodes += 1
+                    real_next_state[i] = infos["final_obs"][i]
+                    writer.add_scalar("metric/episodic_return", infos['final_info']['episode']['r'][i], global_step)
+                    writer.add_scalar("metric/episodic_length", infos['final_info']['episode']['l'][i], global_step)
+                    writer.add_scalar("metric/episodes", episodes, global_step)
+            
 
         obj = tuple_to_tensordict(state, action, reward, real_next_state, done, args.num_envs)
         rb.extend(obj)

@@ -25,7 +25,7 @@ class Args:
     wandb_project: str = f"crossq"
     wandb_mode: str = "disabled"
 
-    env_id: str = "Pendulum-v1"
+    env_id: str = "Walker2d-v5"
     total_timesteps: int = 1_000_000
     use_vf: bool = True
     critic_hidden_size: int = 256
@@ -39,10 +39,11 @@ class Args:
     alpha: float = 0.2
     adam_betas: tuple = (0.5, 0.999)
     bn_momentum: float = 0.01
+    bn_warmup: int = 100_000
 
     buffer_size: int = 100_000
     batch_size: int = 256
-    warmup_timesteps: int = 5_000
+    warmup_timesteps: int = 10_000
 
     update_policy_frequency: int = 3
 
@@ -58,12 +59,12 @@ class QNetwork(nn.Module):
         hidden_size = args.critic_hidden_size
         momentum = args.bn_momentum
         self.network = nn.Sequential(
-            BatchRenorm1d(n_observations + n_actions, momentum=momentum),
+            BatchRenorm1d(n_observations + n_actions, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.Linear(n_observations + n_actions, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum),
+            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum),
+            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
@@ -80,12 +81,12 @@ class Policy(nn.Module):
         hidden_size = args.actor_hidden_size
         momentum = args.bn_momentum
         self.network = nn.Sequential(
-            BatchRenorm1d(n_observations, momentum=momentum),
+            BatchRenorm1d(n_observations, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.Linear(n_observations, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum),
+            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum),
+            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU()
         )
 

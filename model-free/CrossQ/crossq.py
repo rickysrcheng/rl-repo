@@ -46,7 +46,7 @@ class Args:
 
     buffer_size: int = 100_000
     batch_size: int = 256
-    warmup_timesteps: int = 10_000
+    warmup_timesteps: int = 5_000
 
     update_policy_frequency: int = 3
 
@@ -85,7 +85,11 @@ class QNetwork(nn.Module):
             nn.Linear(hidden_size, 1)
         )
 
-    def forward(self, state, action):
+    def forward(self, state, action, train=False):
+        if train:
+            self.train()
+        else:
+            self.eval()
         x = torch.cat((state, action), dim=1)
         return self.network(x)
 
@@ -116,7 +120,11 @@ class Policy(nn.Module):
             "action_bias", torch.tensor((env.action_space.high[0] + env.action_space.low[0]) / 2.0, dtype=torch.float32)
         )
 
-    def forward(self, x):
+    def forward(self, x, train=False):
+        if train:
+            self.train()
+        else:
+            self.eval()
         LOG_STD_MIN = -5
         LOG_STD_MAX = 2
         x = self.network(x)
@@ -127,8 +135,8 @@ class Policy(nn.Module):
         logstd = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (logstd + 1)
         return mean, logstd
     
-    def select_action(self, x):
-        mean, logstd = self(x)
+    def select_action(self, x, train=False):
+        mean, logstd = self(x, train)
         std = logstd.exp()
         # create squashed Gaussian distribution
         normal = Normal(mean, std)
@@ -160,7 +168,8 @@ if __name__ == "__main__":
     
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
     )
 
     if args.tracking:
@@ -227,14 +236,21 @@ if __name__ == "__main__":
         next_state, reward, terminated, truncated, infos = envs.step(action)
         done = np.logical_or(terminated, truncated)
 
+        # gymnasium doesn't have a "final_observation" key in infos anymore?
         if "episode" in infos:
             for idx in range(args.num_envs):
                 if infos["_episode"][idx]:
                     #print(f"global_step={global_step}, episodic_return={infos['episode']['r'][idx]}")
                     writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
                     writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
+        
+        # https://farama.org/Vector-Autoreset-Mode, change to SAME_STEP autoreset mode
+        real_next_state = next_state.copy()
+        for i in range(envs.num_envs):
+            if terminated[i] or truncated[i]:
+                real_next_state[i] = infos["final_obs"][i]
 
-        obj = tuple_to_tensordict(state, action, reward, next_state, done, args.num_envs)
+        obj = tuple_to_tensordict(state, action, reward, real_next_state, done, args.num_envs)
         rb.extend(obj)
         state = next_state
         if global_step >= args.warmup_timesteps:
@@ -255,12 +271,8 @@ if __name__ == "__main__":
             combined_action_batch = torch.concat((action_batch, next_state_actions), dim=0)
 
             # Combined Clipped Double Q-learning
-            q_net1.train()
-            q_net2.train()
-            combined_action_values1 = q_net1(combined_state_batch, combined_action_batch)
-            combined_action_values2 = q_net2(combined_state_batch, combined_action_batch)
-            q_net1.eval()
-            q_net2.eval()   
+            combined_action_values1 = q_net1(combined_state_batch, combined_action_batch, train=True)
+            combined_action_values2 = q_net2(combined_state_batch, combined_action_batch, train=True)
 
             # Extract current q values and next Q-values
             q_values1, next_q_values1 = torch.chunk(combined_action_values1, 2, dim=0)
@@ -269,8 +281,6 @@ if __name__ == "__main__":
             # calculate TD Target
             next_q_values = torch.min(next_q_values1, next_q_values2)
             next_state_values =  next_q_values - alpha*next_logp
-
-
             td_target = reward_batch + args.gamma * next_state_values * (1 - done_batch) 
             td_target = td_target.detach()           
             # Compute q_loss
@@ -296,9 +306,7 @@ if __name__ == "__main__":
             # Policy Delay
             if global_step % args.update_policy_frequency == 0:
                 # Optimize actor
-                policy_net.train()
-                action, logp = policy_net.select_action(state_batch)
-                policy_net.eval()
+                action, logp = policy_net.select_action(state_batch, train=True)
 
                 min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action))
 

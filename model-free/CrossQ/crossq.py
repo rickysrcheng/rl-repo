@@ -1,5 +1,5 @@
 import gymnasium as gym
-import math, random
+import random, os
 import numpy as np
 
 from dataclasses import dataclass
@@ -20,15 +20,18 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
     tracking: bool = False
     wandb_entity: str = ""
     wandb_project: str = f"crossq"
     wandb_mode: str = "disabled"
 
     env_id: str = "Walker2d-v5"
+    num_envs: int = 1
+    capture_video: bool = False
+
     total_timesteps: int = 1_000_000
-    use_vf: bool = True
-    critic_hidden_size: int = 256
+    critic_hidden_size: int = 1024
     actor_hidden_size: int = 256
     autotune: bool = True
     seed: int = 42
@@ -38,7 +41,7 @@ class Args:
     tau: float = 0.005
     alpha: float = 0.2
     adam_betas: tuple = (0.5, 0.999)
-    bn_momentum: float = 0.01
+    bn_momentum: float = 0.01 # PyTorch uses (1 - Paper's Value) for momentum
     bn_warmup: int = 100_000
 
     buffer_size: int = 100_000
@@ -51,11 +54,24 @@ class Args:
     target_noise_clip: float = 0.5
 
 
+def make_env(env_id, seed, idx, capture_video, run_name):
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.action_space.seed(seed)
+        return env
+
+    return thunk
+
 class QNetwork(nn.Module):
     def __init__(self, env, args):
         super(QNetwork, self).__init__()
-        n_observations = env.observation_space.shape[0]
-        n_actions = env.action_space.shape[0]
+        n_observations = env.observation_space.shape[1]
+        n_actions = env.action_space.shape[1]
         hidden_size = args.critic_hidden_size
         momentum = args.bn_momentum
         self.network = nn.Sequential(
@@ -76,8 +92,8 @@ class QNetwork(nn.Module):
 class Policy(nn.Module):
     def __init__(self, env, args):
         super(Policy, self).__init__()
-        n_observations = env.observation_space.shape[0]
-        n_actions = env.action_space.shape[0]
+        n_observations = env.observation_space.shape[1]
+        n_actions = env.action_space.shape[1]
         hidden_size = args.actor_hidden_size
         momentum = args.bn_momentum
         self.network = nn.Sequential(
@@ -94,10 +110,10 @@ class Policy(nn.Module):
         self.logstd_head = nn.Linear(hidden_size, n_actions)
 
         self.register_buffer(
-            "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
+            "action_scale", torch.tensor((env.action_space.high[0] - env.action_space.low[0]) / 2.0, dtype=torch.float32)
         )
         self.register_buffer(
-            "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
+            "action_bias", torch.tensor((env.action_space.high[0] + env.action_space.low[0]) / 2.0, dtype=torch.float32)
         )
 
     def forward(self, x):
@@ -126,22 +142,26 @@ class Policy(nn.Module):
 
         return action, log_prob
 
-def tuple_to_tensordict(state, action, reward, next_state, done):
+def tuple_to_tensordict(state, action, reward, next_state, done, n_envs=None):
     return TensorDict({
         "state": torch.tensor(state, dtype=torch.float32),
         "action": torch.tensor(action),
         "reward": torch.tensor(reward, dtype=torch.float32),
         "next_state": torch.tensor(next_state, dtype=torch.float32),
         "done": torch.tensor(done, dtype=torch.float32)
-    }, batch_size=[])
+    }, batch_size=[n_envs] if n_envs else [])
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    env = gym.make(args.env_id)
-    env.action_space.seed(args.seed)
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+    )
 
     if args.tracking:
         import wandb
@@ -168,18 +188,18 @@ if __name__ == "__main__":
     )
 
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(env.action_space.shape[0]).to(device)).item()
+        target_entropy = -torch.prod(torch.Tensor(envs.action_space.shape[1]).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.learning_rate)
     else:
         alpha = args.alpha
 
-    policy_net = Policy(env, args).to(device)
+    policy_net = Policy(envs, args).to(device)
     policy_net.eval()
 
-    q_net1 = QNetwork(env, args).to(device)  
-    q_net2 = QNetwork(env, args).to(device)
+    q_net1 = QNetwork(envs, args).to(device)  
+    q_net2 = QNetwork(envs, args).to(device)
     q_net1.eval()
     q_net2.eval()   
 
@@ -191,27 +211,31 @@ if __name__ == "__main__":
     rb = ReplayBuffer(storage=LazyTensorStorage(args.buffer_size), 
                       batch_size=args.batch_size)
     
-    state, _ = env.reset()
+    state, _ = envs.reset(seed=args.seed)
     episode_return = 0
     episode_length = 0
     episodes = 0
     for global_step in range(args.total_timesteps):
 
         if global_step < args.warmup_timesteps:
-            action = env.action_space.sample()
+            action = envs.action_space.sample()
         else:
             learning_step = global_step - args.warmup_timesteps
-            action, logp = policy_net.select_action(torch.tensor(state,dtype=torch.float32, device=device).unsqueeze(0))
-            action = action.squeeze(0).cpu().detach().numpy()
+            action, logp = policy_net.select_action(torch.tensor(state,dtype=torch.float32, device=device))
+            action = action.cpu().detach().numpy()
 
-        next_state, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+        next_state, reward, terminated, truncated, infos = envs.step(action)
+        done = np.logical_or(terminated, truncated)
 
-        episode_return += reward
-        episode_length += 1
-        
-        obj = tuple_to_tensordict(state, action, reward, next_state, float(done))
-        rb.add(obj)
+        if "episode" in infos:
+            for idx in range(args.num_envs):
+                if infos["_episode"][idx]:
+                    #print(f"global_step={global_step}, episodic_return={infos['episode']['r'][idx]}")
+                    writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
+                    writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
+
+        obj = tuple_to_tensordict(state, action, reward, next_state, done, args.num_envs)
+        rb.extend(obj)
         state = next_state
         if global_step >= args.warmup_timesteps:
             batch = rb.sample()
@@ -219,8 +243,8 @@ if __name__ == "__main__":
             state_batch = batch['state'].to(device)
             next_state_batch = batch['next_state'].to(device)
             action_batch = batch['action'].to(device)
-            reward_batch = batch['reward'].to(device)
-            done_batch = batch['done'].to(device)
+            reward_batch = batch['reward'].unsqueeze(1).to(device)
+            done_batch = batch['done'].unsqueeze(1).to(device)
 
             # Compute TD Target
             with torch.no_grad():
@@ -233,8 +257,8 @@ if __name__ == "__main__":
             # Combined Clipped Double Q-learning
             q_net1.train()
             q_net2.train()
-            combined_action_values1 = q_net1(combined_state_batch, combined_action_batch).squeeze(1)
-            combined_action_values2 = q_net2(combined_state_batch, combined_action_batch).squeeze(1)
+            combined_action_values1 = q_net1(combined_state_batch, combined_action_batch)
+            combined_action_values2 = q_net2(combined_state_batch, combined_action_batch)
             q_net1.eval()
             q_net2.eval()   
 
@@ -244,7 +268,8 @@ if __name__ == "__main__":
 
             # calculate TD Target
             next_q_values = torch.min(next_q_values1, next_q_values2)
-            next_state_values =  next_q_values - alpha*next_logp.squeeze(1)
+            next_state_values =  next_q_values - alpha*next_logp
+
 
             td_target = reward_batch + args.gamma * next_state_values * (1 - done_batch) 
             td_target = td_target.detach()           
@@ -275,9 +300,9 @@ if __name__ == "__main__":
                 action, logp = policy_net.select_action(state_batch)
                 policy_net.eval()
 
-                min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
+                min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action))
 
-                actor_loss = (alpha*logp.squeeze(1) - min_q).mean()
+                actor_loss = (alpha*logp - min_q).mean()
                 
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 policy_optimizer.zero_grad()
@@ -295,16 +320,16 @@ if __name__ == "__main__":
                     alpha = log_alpha.exp().item()
 
 
-        if done:
-            state, _ = env.reset()
-            writer.add_scalar("metric/episodic_return", episode_return, global_step)
-            writer.add_scalar("metric/episodic_length", episode_length, global_step)
-            writer.add_scalar("metric/episodes", episodes, global_step)
+        # if done:
+        #     state, _ = env.reset()
+        #     writer.add_scalar("metric/episodic_return", episode_return, global_step)
+        #     writer.add_scalar("metric/episodic_length", episode_length, global_step)
+        #     writer.add_scalar("metric/episodes", episodes, global_step)
 
-            episode_return = 0
-            episode_length = 0
-            episodes += 1
-    env.close()
+        #     episode_return = 0
+        #     episode_length = 0
+        #     episodes += 1
+    envs.close()
     
 
 

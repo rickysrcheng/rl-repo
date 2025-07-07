@@ -235,16 +235,7 @@ if __name__ == "__main__":
             action = action.cpu().detach().numpy()
 
         next_state, reward, terminated, truncated, infos = envs.step(action)
-        done = np.logical_or(terminated, truncated)
 
-        # # gymnasium doesn't have a "final_observation" key in infos anymore?
-        # if "episode" in infos:
-        #     for idx in range(args.num_envs):
-        #         if infos["_episode"][idx]:
-        #             #print(f"global_step={global_step}, episodic_return={infos['episode']['r'][idx]}")
-        #             writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
-        #             writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
-        
         # https://farama.org/Vector-Autoreset-Mode, change to SAME_STEP autoreset mode
         #pprint.pprint(infos)  # Print the infos dictionary for debugging
         real_next_state = next_state.copy()
@@ -257,8 +248,8 @@ if __name__ == "__main__":
                     writer.add_scalar("metric/episodic_length", infos['final_info']['episode']['l'][i], global_step)
                     writer.add_scalar("metric/episodes", episodes, global_step)
             
-
-        obj = tuple_to_tensordict(state, action, reward, real_next_state, done, args.num_envs)
+        # if truncated, use real_next_state
+        obj = tuple_to_tensordict(state, action, reward, real_next_state, terminated, args.num_envs)
         rb.extend(obj)
         state = next_state
         if global_step >= args.warmup_timesteps:
@@ -334,17 +325,7 @@ if __name__ == "__main__":
                     alpha_loss.backward()
                     a_optimizer.step()
                     alpha = log_alpha.exp().item()
-
-
-        # if done:
-        #     state, _ = env.reset()
-        #     writer.add_scalar("metric/episodic_return", episode_return, global_step)
-        #     writer.add_scalar("metric/episodic_length", episode_length, global_step)
-        #     writer.add_scalar("metric/episodes", episodes, global_step)
-
-        #     episode_return = 0
-        #     episode_length = 0
-        #     episodes += 1
+                    
     envs.close()
     
 

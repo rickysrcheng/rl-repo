@@ -16,7 +16,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
-env_id = "Walker2d-v5"  # Example environment ID
+env_id = "HalfCheetah-v4"  # Example environment ID
 seed = 42
 capture_video = False
 run_name = "crossq_example_run"
@@ -42,8 +42,9 @@ while True:
         for i in range(envs.num_envs):
             if infos['_final_info'][i]:
                 print(f"Env {i} finished with reward: {infos['final_info']['episode']['r'][i]}")
+                print(truncations[i], terminations[i])
                 print(infos['final_obs'][i])
                 real_next_state[i] = infos['final_obs'][i]
-                print(real_next_state)
+
             # Optionally reset the environment if needed
             # envs.reset_at(i)

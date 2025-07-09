@@ -44,6 +44,7 @@ class Args:
     adam_betas: tuple = (0.5, 0.999)
     bn_momentum: float = 0.01 # PyTorch uses (1 - Paper's Value) for momentum
     bn_warmup: int = 100_000
+    bn_type: str = "brn"
 
     buffer_size: int = 100_000
     batch_size: int = 256
@@ -183,7 +184,6 @@ class BatchRenorm(torch.nn.Module):
             f"warmup_steps={self.warmup_steps}, affine={self.affine}"
         )
 
-
 class BatchRenorm1d(BatchRenorm):
     def _check_input_dim(self, x: torch.Tensor) -> None:
         if x.dim() == 1:
@@ -196,16 +196,18 @@ class QNetwork(nn.Module):
         n_actions = env.action_space.shape[1]
         hidden_size = args.critic_hidden_size
         momentum = args.bn_momentum
+        if args.bn_type == "brn":
+            BN = BatchRenorm1d
+        else:
+            BN = nn.BatchNorm1d
+
         self.network = nn.Sequential(
-            BatchRenorm1d(n_observations + n_actions, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(n_observations + n_actions, momentum=momentum),
+            BN(n_observations + n_actions, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.Linear(n_observations + n_actions, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(hidden_size, momentum=momentum),
+            BN(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(hidden_size, momentum=momentum),
+            BN(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
@@ -225,16 +227,19 @@ class Policy(nn.Module):
         n_actions = env.action_space.shape[1]
         hidden_size = args.actor_hidden_size
         momentum = args.bn_momentum
+
+        if args.bn_type == "brn":
+            BN = BatchRenorm1d
+        else:
+            BN = nn.BatchNorm1d
+
         self.network = nn.Sequential(
-            BatchRenorm1d(n_observations, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(n_observations, momentum=momentum),
+            BN(n_observations, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.Linear(n_observations, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(hidden_size, momentum=momentum),
+            BN(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
-            BatchRenorm1d(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
-            #nn.BatchNorm1d(hidden_size, momentum=momentum),
+            BN(hidden_size, momentum=momentum, warmup_steps=args.bn_warmup),
             nn.ReLU()
         )
 

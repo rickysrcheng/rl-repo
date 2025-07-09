@@ -30,12 +30,12 @@ class Args:
     env_id: str = "Walker2d-v5"
     num_envs: int = 1
     capture_video: bool = False
+    seed: int = 42
 
     total_timesteps: int = 1_000_000
     critic_hidden_size: int = 1024
     actor_hidden_size: int = 256
     autotune: bool = True
-    seed: int = 42
 
     learning_rate: float = 1e-3
     gamma: float = 0.99

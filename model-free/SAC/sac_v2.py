@@ -1,5 +1,6 @@
 import gymnasium as gym
-import math
+import math, random, os
+import numpy as np
 
 from dataclasses import dataclass
 import tyro
@@ -18,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
 class Args:
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
     tracking: bool = False
     wandb_entity: str = ""
     wandb_project: str = f"sac-v2"
@@ -26,6 +28,9 @@ class Args:
     env_id: str = "Walker2d-v5"
     total_timesteps: int = 1_000_000
     use_vf: bool = True
+    num_envs: int = 1
+    capture_video: bool = False
+    seed: int = 42
 
 
     learning_rate: float = 3e-4
@@ -46,12 +51,24 @@ class Args:
     target_policy_noise: float = 0.2
     target_noise_clip: float = 0.5
 
+def make_env(env_id, seed, idx, capture_video, run_name):
+    def thunk():
+        if capture_video and idx == 0:
+            env = gym.make(env_id, render_mode="rgb_array")
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        else:
+            env = gym.make(env_id)
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env.action_space.seed(seed)
+        return env
+
+    return thunk
 
 class QNetwork(nn.Module):
     def __init__(self, env):
         super(QNetwork, self).__init__()
-        n_observations = env.observation_space.shape[0]
-        n_actions = env.action_space.shape[0]
+        n_observations = env.single_observation_space.shape[0]
+        n_actions = env.single_action_space.shape[0]
         self.network = nn.Sequential(
             nn.Linear(n_observations + n_actions, 256),
             nn.ReLU(),
@@ -67,8 +84,8 @@ class QNetwork(nn.Module):
 class Policy(nn.Module):
     def __init__(self, env):
         super(Policy, self).__init__()
-        n_observations = env.observation_space.shape[0]
-        n_actions = env.action_space.shape[0]
+        n_observations = env.single_observation_space.shape[0]
+        n_actions = env.single_action_space.shape[0]
         self.network = nn.Sequential(
             nn.Linear(n_observations, 256),
             nn.ReLU(),
@@ -133,18 +150,28 @@ def soft_update(net, target_net, args):
     for param, target_param in zip(net.parameters(), target_net.parameters()):
         target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-def tuple_to_tensordict(state, action, reward, next_state, done):
+def tuple_to_tensordict(state, action, reward, next_state, done, n_envs=None):
     return TensorDict({
         "state": torch.tensor(state, dtype=torch.float32),
         "action": torch.tensor(action),
         "reward": torch.tensor(reward, dtype=torch.float32),
         "next_state": torch.tensor(next_state, dtype=torch.float32),
         "done": torch.tensor(done, dtype=torch.float32)
-    }, batch_size=[])
+    }, batch_size=[n_envs] if n_envs else [])
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    env = gym.make(args.env_id)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    
+    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    envs = gym.vector.SyncVectorEnv(
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP
+    )
+
     if args.tracking:
         import wandb
         run = wandb.init(
@@ -169,13 +196,13 @@ if __name__ == "__main__":
         "cpu"
     )
 
-    policy_net = Policy(env).to(device)
+    policy_net = Policy(envs).to(device)
 
-    q_net1 = QNetwork(env).to(device)    
-    q_net2 = QNetwork(env).to(device)
+    q_net1 = QNetwork(envs).to(device)    
+    q_net2 = QNetwork(envs).to(device)
 
-    target_q_net1 = QNetwork(env).to(device)    
-    target_q_net2 = QNetwork(env).to(device)
+    target_q_net1 = QNetwork(envs).to(device)    
+    target_q_net2 = QNetwork(envs).to(device)
     target_q_net1.load_state_dict(q_net1.state_dict())
     target_q_net2.load_state_dict(q_net2.state_dict())
 
@@ -191,36 +218,45 @@ if __name__ == "__main__":
     rb = ReplayBuffer(storage=LazyTensorStorage(args.buffer_size), 
                       batch_size=args.batch_size)
     
-    state, _ = env.reset()
+    state, _ = envs.reset()
     episode_return = 0
     episode_length = 0
     episodes = 0
     for global_step in range(args.total_timesteps):
 
         if global_step < args.warmup_timesteps:
-            action = env.action_space.sample()
+            action = envs.action_space.sample()
         else:
             learning_step = global_step - args.warmup_timesteps
-            action, logp = policy_net.select_action(torch.tensor(state,dtype=torch.float32, device=device).unsqueeze(0))
-            action = action.squeeze(0).cpu().detach().numpy()
+            action, logp = policy_net.select_action(torch.tensor(state,dtype=torch.float32, device=device))
+            action = action.cpu().detach().numpy()
 
-        next_state, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+        next_state, reward, terminated, truncated, infos = envs.step(action)
 
-        episode_return += reward
-        episode_length += 1
+        real_next_state = next_state.copy()
+        if "_final_info" in infos:
+            for i in range(envs.num_envs):
+                if infos["_final_info"][i]: # this env has finished this step
+                    episodes += 1
+                    real_next_state[i] = infos["final_obs"][i]
+                    writer.add_scalar("metric/episodic_return", infos['final_info']['episode']['r'][i], global_step)
+                    writer.add_scalar("metric/episodic_length", infos['final_info']['episode']['l'][i], global_step)
+                    writer.add_scalar("metric/episodes", episodes, global_step)
+            
+        # if truncated, use real_next_state
+        obj = tuple_to_tensordict(state, action, reward, real_next_state, terminated, args.num_envs)
+        rb.extend(obj)
         
-        obj = tuple_to_tensordict(state, action, reward, next_state, float(done))
-        rb.add(obj)
         state = next_state
+
         if global_step >= args.warmup_timesteps:
             batch = rb.sample()
 
             state_batch = batch['state'].to(device)
             next_state_batch = batch['next_state'].to(device)
             action_batch = batch['action'].to(device)
-            reward_batch = batch['reward'].to(device)
-            done_batch = batch['done'].to(device)
+            reward_batch = batch['reward'].unsqueeze(1).to(device)
+            done_batch = batch['done'].unsqueeze(1).to(device)
 
             # Compute TD Target
             with torch.no_grad():
@@ -228,15 +264,15 @@ if __name__ == "__main__":
                 next_state_actions, next_logp = policy_net.select_action(next_state_batch)
 
                 # Clipped Double Q-learning
-                q_values1 = target_q_net1(next_state_batch, next_state_actions).squeeze(1)
-                q_values2 = target_q_net2(next_state_batch, next_state_actions).squeeze(1)
+                q_values1 = target_q_net1(next_state_batch, next_state_actions)
+                q_values2 = target_q_net2(next_state_batch, next_state_actions)
                 q_values = torch.min(q_values1, q_values2)
 
-                next_state_values =  q_values - args.alpha*next_logp.squeeze(1)
+                next_state_values =  q_values - args.alpha*next_logp
                 td_target = reward_batch + args.gamma * next_state_values * (1 - done_batch)
 
-            state_action_values1 = q_net1(state_batch, action_batch).squeeze(1)
-            state_action_values2 = q_net2(state_batch, action_batch).squeeze(1)
+            state_action_values1 = q_net1(state_batch, action_batch)
+            state_action_values2 = q_net2(state_batch, action_batch)
 
             # Compute q_loss
             q1_loss = F.mse_loss(state_action_values1, td_target)
@@ -260,9 +296,9 @@ if __name__ == "__main__":
 
             # Optimize actor
             action, logp = policy_net.select_action(state_batch)
-            min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action)).squeeze(1)
+            min_q = torch.min(q_net1(state_batch, action), q_net2(state_batch, action))
 
-            actor_loss = (args.alpha*logp.squeeze(1) - min_q).mean()
+            actor_loss = (args.alpha*logp - min_q).mean()
             
             writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
             policy_optimizer.zero_grad()
@@ -274,17 +310,7 @@ if __name__ == "__main__":
             soft_update(q_net1, target_q_net1, args)
             soft_update(q_net2, target_q_net2, args)
 
-
-        if done:
-            state, _ = env.reset()
-            writer.add_scalar("metric/episodic_return", episode_return, global_step)
-            writer.add_scalar("metric/episodic_length", episode_length, global_step)
-            writer.add_scalar("metric/episodes", episodes, global_step)
-
-            episode_return = 0
-            episode_length = 0
-            episodes += 1
-    env.close()
+    envs.close()
     
 
 

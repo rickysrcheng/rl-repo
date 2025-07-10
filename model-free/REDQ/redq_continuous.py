@@ -302,23 +302,6 @@ if __name__ == "__main__":
             # only add losses for last update
             writer.add_scalar("losses/avg_q_val", state_action_values.mean().item(), global_step)
             writer.add_scalar("losses/total_q_loss", total_loss.item(), global_step)
-
-            # Optimize actor
-            action, logp = policy_net.select_action(state_batch)
-
-            with torch.no_grad():
-                redq_val = redq_net(state_batch, action)
-            avg_q_val = torch.mean(redq_val, dim=0)
-
-            actor_loss = (args.alpha*logp - avg_q_val).mean()
-            
-            writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-            policy_optimizer.zero_grad()
-            actor_loss.backward()
-            redq_optimizer.step()
-            #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-            policy_optimizer.step()
-
     envs.close()
     
 

@@ -199,7 +199,6 @@ if __name__ == "__main__":
 
     redq_net = RandomizedEnsembleQNetwork(envs, args).to(device)    
 
-
     target_redq_net = RandomizedEnsembleQNetwork(envs, args).to(device)    
     target_redq_net.load_state_dict(redq_net.state_dict())
 
@@ -240,10 +239,7 @@ if __name__ == "__main__":
         state = next_state
 
         if global_step >= args.warmup_timesteps:
-            utd_q_val = 0.0
-            utd_total_loss = 0.0
-
-            for _ in range(args.g_utd_ratio):
+            for i_update in range(args.g_utd_ratio):
                 batch = rb.sample()
 
                 state_batch = batch['state'].to(device)
@@ -251,14 +247,13 @@ if __name__ == "__main__":
                 action_batch = batch['action'].to(device)
                 reward_batch = batch['reward'].unsqueeze(1).to(device)
                 done_batch = batch['done'].unsqueeze(1).to(device)
-
                 # Compute TD Target
                 with torch.no_grad():
                     # Let Policy net choose actions
                     next_state_actions, next_logp = policy_net.select_action(next_state_batch)
 
                     # Clipped Double Q-learning
-                    q_values = redq_net(next_state_batch, next_state_actions, random_sample=True)
+                    q_values = target_redq_net(next_state_batch, next_state_actions, random_sample=True)
                     q_values = torch.min(q_values, dim=0)[0]
 
                     next_state_values =  q_values - args.alpha*next_logp
@@ -270,25 +265,49 @@ if __name__ == "__main__":
                 td_targets_expanded = td_target.unsqueeze(0).expand_as(state_action_values)
 
                 # Compute q_loss
-                losses = F.mse_loss(state_action_values, td_targets_expanded, reduction='none')
-                total_loss = losses.mean(dim=(1,2)).sum()
+                # multiply by num_q_nets to get rid of final q network averaging
+                total_loss = F.mse_loss(state_action_values, td_targets_expanded) * args.num_q_nets
 
-                utd_q_val += state_action_values.mean().item()
-                utd_total_loss += total_loss.item()
                 # Optimize q networks
                 redq_optimizer.zero_grad()
                 total_loss.backward()
+
+                if i_update == args.g_utd_ratio - 1:
+                                        # Optimize actor
+                    action, logp = policy_net.select_action(state_batch)
+
+                    # freeze redq_net for the actor loss computation but keep gradients
+                    redq_net.requires_grad_(False)
+                    redq_val = redq_net(state_batch, action)
+                    avg_q_val = redq_val.mean(dim=0)
+
+                    actor_loss = (args.alpha*logp - avg_q_val).mean()
+                    
+                    writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                    policy_optimizer.zero_grad()
+                    actor_loss.backward()
+
+                    # unfreeze redq_net for the q network updates
+                    # huh????
+                    redq_net.requires_grad_(True)
+                
+                # apparently in the official implementation, they do this???
+                # why step after the policy gradients?
                 redq_optimizer.step()
+                if i_update == args.g_utd_ratio - 1:
+                    policy_optimizer.step()
                
                 soft_update(redq_net, target_redq_net, args)
 
-            writer.add_scalar("losses/avg_q_val", utd_q_val/args.g_utd_ratio, global_step)
-            writer.add_scalar("losses/total_q_loss", utd_total_loss/args.g_utd_ratio, global_step)
+            # only add losses for last update
+            writer.add_scalar("losses/avg_q_val", state_action_values.mean().item(), global_step)
+            writer.add_scalar("losses/total_q_loss", total_loss.item(), global_step)
 
             # Optimize actor
             action, logp = policy_net.select_action(state_batch)
 
-            redq_val = redq_net(state_batch, action)
+            with torch.no_grad():
+                redq_val = redq_net(state_batch, action)
             avg_q_val = torch.mean(redq_val, dim=0)
 
             actor_loss = (args.alpha*logp - avg_q_val).mean()
@@ -296,6 +315,7 @@ if __name__ == "__main__":
             writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
             policy_optimizer.zero_grad()
             actor_loss.backward()
+            redq_optimizer.step()
             #torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
             policy_optimizer.step()
 

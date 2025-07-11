@@ -218,9 +218,7 @@ if __name__ == "__main__":
     rb = ReplayBuffer(storage=LazyTensorStorage(args.buffer_size), 
                       batch_size=args.batch_size)
     
-    state, _ = envs.reset()
-    episode_return = 0
-    episode_length = 0
+    state, _ = envs.reset(seed=args.seed)
     episodes = 0
     for global_step in range(args.total_timesteps):
 

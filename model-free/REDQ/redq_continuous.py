@@ -11,7 +11,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.distributions import Normal, TanhTransform, AffineTransform, TransformedDistribution
+import torch.func as func
+from torch.func import vmap
+from torch.distributions import Normal
 
 from torchrl.data import ReplayBuffer, LazyTensorStorage
 from tensordict import TensorDict
@@ -67,31 +69,106 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
+class QNetwork(nn.Module):
+    def __init__(self, input_dim):
+        super(QNetwork, self).__init__()
+
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
 class RandomizedEnsembleQNetwork(nn.Module):
     def __init__(self, env, args):
         super(RandomizedEnsembleQNetwork, self).__init__()
         n_observations = env.single_observation_space.shape[0]
         n_actions = env.single_action_space.shape[0]
-
+        input_dim = n_observations + n_actions
         self.num_q_nets = args.num_q_nets
         self.m_q_samples = args.m_q_samples
-
-        self.network = nn.ModuleList([nn.Sequential(
-            nn.Linear(n_observations + n_actions, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        ) for _ in range(self.num_q_nets)
+        self.network = nn.ModuleList([
+            QNetwork(input_dim) for _ in range(self.num_q_nets)
         ])
 
     def forward(self, state, action, random_sample=False):
         x = torch.cat((state, action), dim=1)
         if random_sample:
             sampled_idx = random.sample(range(self.num_q_nets), self.m_q_samples)
-            return torch.stack([self.network[i](x) for i in sampled_idx]) # returns shape (m, b, f)
+            return torch.stack([self.network[i](x) for i in sampled_idx])
         else:
-            return torch.stack([self.network[i](x) for i in range(self.num_q_nets)]) # returns shape (n, b, f)
+            return torch.stack([self.network[i](x) for i in range(self.num_q_nets)])
+
+class BatchRandomizedEnsembleQNetwork(nn.Module):
+    """
+    Essentially merge all network parameter into a giant tensor
+    Batch compute the forward pass for all networks.
+    Seeing 30% speedup compared to naive modulelist method above
+    """
+    def __init__(self, env, args):
+        super(BatchRandomizedEnsembleQNetwork, self).__init__()
+        n_observations = env.single_observation_space.shape[0]
+        n_actions = env.single_action_space.shape[0]
+        input_dim = n_observations + n_actions
+        self.num_q_nets = args.num_q_nets
+        self.m_q_samples = args.m_q_samples
+        
+        # Create batched parameters for all layers
+        # Layer 1: input_dim -> 256
+        self.w1 = nn.Parameter(torch.empty(self.num_q_nets, 256, input_dim))
+        self.b1 = nn.Parameter(torch.empty(self.num_q_nets, 256))
+        
+        # Layer 2: 256 -> 256  
+        self.w2 = nn.Parameter(torch.empty(self.num_q_nets, 256, 256))
+        self.b2 = nn.Parameter(torch.empty(self.num_q_nets, 256))
+        
+        # Layer 3: 256 -> 1
+        self.w3 = nn.Parameter(torch.empty(self.num_q_nets, 1, 256))
+        self.b3 = nn.Parameter(torch.empty(self.num_q_nets, 1))
+        
+        # Initialize each network's parameters differently
+        for i in range(self.num_q_nets):
+            nn.init.xavier_uniform_(self.w1[i])
+            nn.init.xavier_uniform_(self.w2[i]) 
+            nn.init.xavier_uniform_(self.w3[i])
+            nn.init.zeros_(self.b1[i])
+            nn.init.zeros_(self.b2[i])
+            nn.init.zeros_(self.b3[i])
+    
+    def forward(self, state, action, random_sample=False):
+        x = torch.cat((state, action), dim=1)
+        
+        # Select which networks to use
+        if random_sample:
+            idx = random.sample(range(self.num_q_nets), self.m_q_samples)
+            w1, b1 = self.w1[idx], self.b1[idx]
+            w2, b2 = self.w2[idx], self.b2[idx]
+            w3, b3 = self.w3[idx], self.b3[idx]
+            num_nets = self.m_q_samples
+        else:
+            w1, b1 = self.w1, self.b1
+            w2, b2 = self.w2, self.b2
+            w3, b3 = self.w3, self.b3
+            num_nets = self.num_q_nets
+        
+        # Reshape input for batch matrix multiply
+        x_expanded = x.unsqueeze(0).expand(num_nets, -1, -1)
+        
+        # Layer 1
+        h1 = torch.bmm(x_expanded, w1.transpose(-1, -2)) + b1.unsqueeze(1)
+        h1 = F.relu(h1)
+        
+        # Layer 2
+        h2 = torch.bmm(h1, w2.transpose(-1, -2)) + b2.unsqueeze(1)
+        h2 = F.relu(h2)
+        out = torch.bmm(h2, w3.transpose(-1, -2)) + b3.unsqueeze(1)
+        
+        return out
 
 class Policy(nn.Module):
     def __init__(self, env):
@@ -197,9 +274,9 @@ if __name__ == "__main__":
 
     policy_net = Policy(envs).to(device)
 
-    redq_net = RandomizedEnsembleQNetwork(envs, args).to(device)    
+    redq_net = BatchRandomizedEnsembleQNetwork(envs, args).to(device)    
 
-    target_redq_net = RandomizedEnsembleQNetwork(envs, args).to(device)    
+    target_redq_net = BatchRandomizedEnsembleQNetwork(envs, args).to(device)    
     target_redq_net.load_state_dict(redq_net.state_dict())
 
     policy_optimizer = optim.Adam(policy_net.parameters(), lr=args.learning_rate)
@@ -292,13 +369,13 @@ if __name__ == "__main__":
                     redq_net.requires_grad_(True)
                 
                 # apparently in the official implementation, they do this???
-                # why step after the policy gradients?
+                # why step after the policy gradients, because doing it before means you don't need to 
+                # declare the redq_net as requires_grad_(False)
                 redq_optimizer.step()
                 if i_update == args.g_utd_ratio - 1:
                     policy_optimizer.step()
                
                 soft_update(redq_net, target_redq_net, args)
-
             # only add losses for last update
             writer.add_scalar("losses/avg_q_val", state_action_values.mean().item(), global_step)
             writer.add_scalar("losses/total_q_loss", total_loss.item(), global_step)

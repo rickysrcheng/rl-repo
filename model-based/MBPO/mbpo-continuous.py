@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch.distributions import Normal, TanhTransform, AffineTransform, TransformedDistribution
 
 from torchrl.data import ReplayBuffer, LazyTensorStorage
-from tensordict import TensorDict
+from tensordict import TensorDict, merge_tensordicts
 from torch.utils.tensorboard import SummaryWriter
 
 @dataclass
@@ -50,8 +50,8 @@ class Args:
     tau: float = 0.005
     alpha: float = 0.2
 
-    env_buffer_size: int = 100_000
-    model_buffer_size: int = 20_000
+    env_buffer_size: int = 1_000_000
+    model_buffer_size: int = 400_000
     batch_size: int = 256
     warmup_timesteps: int = 5_000
 
@@ -94,13 +94,16 @@ class DynamicsNetwork(nn.Module):
         self.next_state_mean_head = nn.Linear(hidden_dim, output_dim)
         self.next_state_logstd_head = nn.Linear(hidden_dim, output_dim)
         self.reward_head = nn.Linear(hidden_dim, 1)
+        self.done_head = nn.Linear(hidden_dim, 1)
     
     def forward(self, x):
         x = self.network(x)
         mean = self.next_state_mean_head(x)
         logstd = self.next_state_logstd_head(x)
         reward = self.reward_head(x)
-        return mean, logstd, reward
+        done_logit = self.done_head(x)
+
+        return mean, logstd, reward, done_logit
 
 # simple looped version, could use batched mm
 class EnsembleDynamicsNetwork(nn.Module):
@@ -118,29 +121,34 @@ class EnsembleDynamicsNetwork(nn.Module):
         LOG_STD_MIN = -5
         LOG_STD_MAX = 2
         x = torch.cat((states, actions), dim=1)
-        means, logstds, rewards = [], [], []
+        means, logstds, rewards, done_logits = [], [], [], []
 
         for model in self.network:
-            mean, logstd, reward = model(x)
+            mean, logstd, reward, done_logit = model(x)
             means.append(mean)
             logstds.append(logstd)
             rewards.append(reward)
+            done_logits.append(done_logit)
         
         means = torch.stack(means, dim=0)
         logstds = torch.stack(logstds, dim=0)
         rewards = torch.stack(rewards, dim=0)
+        done_logits = torch.stack(done_logits, dim=0)
 
         logstds = torch.tanh(logstds)
         logstds = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (logstds + 1)
-        return means, logstds, rewards
+        return means, logstds, rewards, done_logits
 
     def sample_from_one_model(self, states, actions, model_idx):
         x = torch.cat((states, actions), dim=1)
-        mean, logstd, reward = self.network[model_idx](x)
+        mean, logstd, reward, done_logit = self.network[model_idx](x)
         std = logstd.exp()
         dist = Normal(mean, std)
         next_state = dist.rsample()
-        return next_state, reward
+
+        done_prob = torch.sigmoid(done_logit)
+        done = torch.bernoulli(done_prob)
+        return next_state, reward, done
 
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -219,17 +227,18 @@ def tuple_to_tensordict(state, action, reward, next_state, done, n_envs=None):
     return TensorDict({
         "state": torch.tensor(state, dtype=torch.float32),
         "action": torch.tensor(action),
-        "reward": torch.tensor(reward, dtype=torch.float32),
+        "reward": torch.tensor(reward, dtype=torch.float32).unsqueeze(0),
         "next_state": torch.tensor(next_state, dtype=torch.float32),
-        "done": torch.tensor(done, dtype=torch.float32)
-    }, batch_size=[n_envs] if n_envs else [])
+        "done": torch.tensor(done, dtype=torch.float32).unsqueeze(0)
+    }, batch_size=[n_envs] if n_envs else [1])
 
-def tensor_to_tensordict(state, action, reward, next_state, n_batch=None):
+def tensor_to_tensordict(state, action, reward, next_state, done, n_batch=None):
     return TensorDict({
         "state": state,
         "action": action,
         "reward": reward,
-        "next_state": next_state
+        "next_state": next_state,
+        "done": done
     }, batch_size=[n_batch] if n_batch else [1])
 
 if __name__ == "__main__":
@@ -289,7 +298,7 @@ if __name__ == "__main__":
     rb_env = ReplayBuffer(storage=LazyTensorStorage(args.env_buffer_size), 
                       batch_size=args.batch_size)
     rb_model = ReplayBuffer(storage=LazyTensorStorage(args.model_buffer_size), 
-                      batch_size=args.batch_size)
+                      batch_size=math.floor(0.95*args.batch_size))
     
     state, _ = envs.reset(seed=args.seed)
     episodes = 0
@@ -312,39 +321,43 @@ if __name__ == "__main__":
         obj = tuple_to_tensordict(state, action, reward, real_next_state, terminated, args.num_envs)
         rb_env.extend(obj)
         # bootstrap model buffers with real data. It'll be cycled out pretty fast
-        rb_model.extend(obj.exclude("done"))
+        rb_model.extend(obj)
         
         state = next_state
         global_step += 1
 
     for epochs in range(args.n_epochs):
         # first train dynamics model
-        env_batch = rb_env.sample()
+        for env_training in range(3):
+            env_batch = rb_env.sample()
 
-        state_env_batch = env_batch['state'].to(device)
-        next_state_env_batch = env_batch['next_state'].to(device)
-        action_env_batch = env_batch['action'].to(device)
-        reward_env_batch = env_batch['reward'].unsqueeze(1).to(device)
-        done_env_batch = env_batch['done'].unsqueeze(1).to(device)
+            state_env_batch = env_batch['state'].to(device)
+            next_state_env_batch = env_batch['next_state'].to(device)
+            action_env_batch = env_batch['action'].to(device)
+            reward_env_batch = env_batch['reward'].to(device)
+            done_env_batch = env_batch['done'].to(device)
 
-        b_mean, b_logstd, b_reward = dynamics_net(state_env_batch, action_env_batch)
-        b_std = b_logstd.exp()
-        
-        next_state_env_batch_exp = next_state_env_batch.unsqueeze(0).expand_as(b_mean)
-        model_loss = F.gaussian_nll_loss(b_mean, next_state_env_batch_exp, b_std**2)
-        
-        reward_env_batch_exp = reward_env_batch.unsqueeze(0).expand_as(b_reward)
-        reward_loss = F.mse_loss(b_reward, reward_env_batch_exp, reduction='mean')
+            b_mean, b_logstd, b_reward, b_done_logits = dynamics_net(state_env_batch, action_env_batch)
+            b_std = b_logstd.exp()
+            
+            next_state_env_batch_exp = next_state_env_batch.unsqueeze(0).expand_as(b_mean)
+            model_loss = F.gaussian_nll_loss(b_mean, next_state_env_batch_exp, b_std**2)
+            
+            done_env_batch_exp = done_env_batch.unsqueeze(0).expand_as(b_done_logits)
 
-        total_model_loss = model_loss + reward_loss
+            reward_env_batch_exp = reward_env_batch.expand_as(b_reward)
+            reward_loss = F.mse_loss(b_reward, reward_env_batch_exp, reduction='mean')
+            done_loss = F.binary_cross_entropy_with_logits(b_done_logits, done_env_batch_exp)
 
+            total_model_loss = model_loss + reward_loss + done_loss
+
+            dynamics_optimizer.zero_grad()
+            total_model_loss.backward()
+            dynamics_optimizer.step()
         writer.add_scalar("losses/model_loss", model_loss.mean().item(), epochs)
         writer.add_scalar("losses/reward_loss", reward_loss.mean().item(), epochs)
+        writer.add_scalar("losses/done_loss", done_loss.mean().item(), epochs)
         writer.add_scalar("losses/total_model_loss", total_model_loss.mean().item(), epochs)
-
-        dynamics_optimizer.zero_grad()
-        total_model_loss.backward()
-        dynamics_optimizer.step()
 
         if args.k_end == 1:
             k_end = 1
@@ -371,6 +384,7 @@ if __name__ == "__main__":
             # if truncated, use real_next_state
             obj = tuple_to_tensordict(state, action, reward, real_next_state, terminated, args.num_envs)
             rb_env.extend(obj)
+            rb_model.extend(obj)
             state = next_state
 
             # first do naive loop over m rollouts, can probably batch this later
@@ -383,19 +397,22 @@ if __name__ == "__main__":
                     for k in range(k_end):
                         m_action, m_logp = policy_net.select_action(m_state)
 
-                        m_next_states, m_rewards = dynamics_net.sample_from_one_model(m_state, m_action, model_idx)
-                        m_obj = tensor_to_tensordict(m_state, m_action, m_rewards, m_next_states)
+                        m_next_states, m_rewards, m_done = dynamics_net.sample_from_one_model(m_state, m_action, model_idx)
+                        m_obj = tensor_to_tensordict(m_state, m_action, m_rewards, m_next_states, m_done)
                         rb_model.extend(m_obj)
                         m_state = m_next_states
 
             # gradient update phase
             for g_updates in range(args.g_updates):
+                env_batch = rb_env.sample(batch_size=math.ceil(0.05*args.batch_size))
                 model_batch = rb_model.sample()
+                g_batch = torch.cat([env_batch, model_batch], dim=0)
 
-                state_model_batch = model_batch['state'].to(device)
-                next_state_model_batch = model_batch['next_state'].to(device)
-                action_model_batch = model_batch['action'].to(device)
-                reward_model_batch = model_batch['reward'].unsqueeze(1).to(device)
+                state_model_batch = g_batch['state'].to(device)
+                next_state_model_batch = g_batch['next_state'].to(device)
+                action_model_batch = g_batch['action'].to(device)
+                reward_model_batch = g_batch['reward'].to(device)
+                done_model_batch = g_batch['done'].to(device)
 
                 # Compute TD Target
                 with torch.no_grad():
@@ -408,7 +425,7 @@ if __name__ == "__main__":
                     q_values = torch.min(q_values1, q_values2)
 
                     next_state_values =  q_values - args.alpha*next_logp
-                    td_target = reward_model_batch + args.gamma * next_state_values
+                    td_target = reward_model_batch + args.gamma * next_state_values * (1 - done_model_batch)
 
                 state_action_values1 = q_net1(state_model_batch, action_model_batch)
                 state_action_values2 = q_net2(state_model_batch, action_model_batch)

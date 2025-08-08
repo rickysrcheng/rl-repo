@@ -263,13 +263,6 @@ if __name__ == "__main__":
                         writer.add_scalar("metric/episodic_return", infos["episode"]["r"][idx], global_step)
                         writer.add_scalar("metric/episodic_length", infos["episode"]["l"][idx], global_step)
 
-            # if done:
-            #     state, _ = env.reset()
-            #     writer.add_scalar("metric/episodic_return", episode_return, global_step)
-            #     writer.add_scalar("metric/episodic_length", episode_length, global_step)
-            #     episode_return = 0
-            #     episode_length = 0
-
         # Bootstrap last value
         with torch.no_grad():
             last_value = agent.critic(next_state).squeeze(1)

@@ -32,6 +32,17 @@ class Args:
     capture_video: bool = False
     seed: int = 42
 
+    # MBPO hyperparameters
+    num_ensembles: int = 7
+    hidden_dim: int = 200
+    n_epochs: int = 300
+    e_envsteps: int = 1000
+    m_rollouts: int = 400
+
+    k_start: int = 1
+    k_end: int = -1 # use -1 if not increasing
+    k_epoch_start: int = 20
+    k_epoch_end: int = 100
 
     learning_rate: float = 3e-4
     gamma: float = 0.99
@@ -63,6 +74,41 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         return env
 
     return thunk
+
+class DynamicsNetwork(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(DynamicsNetwork, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+
+        self.next_state_mean_head = nn.Linear(hidden_dim, input_dim)
+        self.next_state_logstd_head = nn.Linear(hidden_dim, input_dim)
+        self.reward_head = nn.Linear(hidden_dim, 1)
+    
+    def forward(self, x):
+        x = self.network(x)
+        mean = self.next_state_mean_head(x)
+        logstd = self.next_state_logstd_head(x)
+        reward = self.reward_head(x)
+        return mean, logstd, reward
+
+
+class EnsembleDynamicsNetwork(nn.Module):
+    def __init__(self, env, args):
+        super(EnsembleDynamicsNetwork, self).__init__()
+        n_observations = env.single_observation_space.shape[0]
+        self.network = nn.ModuleList([
+            DynamicsNetwork(n_observations, args.hidden_dim) for _ in args.num_ensembles
+        ])
+
 
 class QNetwork(nn.Module):
     def __init__(self, env):
@@ -220,6 +266,7 @@ if __name__ == "__main__":
     
     state, _ = envs.reset(seed=args.seed)
     episodes = 0
+    global_step = 0
     for global_step in range(args.total_timesteps):
 
         if global_step < args.warmup_timesteps:
